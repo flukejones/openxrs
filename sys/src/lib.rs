@@ -194,6 +194,18 @@ wrapper! {
 }
 
 wrapper! {
+    /// Runtime-issued camera identity; this is not an owned device handle.
+    #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    CameraIdBD(u64)
+}
+
+wrapper! {
+    /// Acquired camera image identity; release it through its capture session.
+    #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    CameraImageIdBD(u64)
+}
+
+wrapper! {
     #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
     Version(u64)
 }

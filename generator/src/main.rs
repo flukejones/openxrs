@@ -676,7 +676,7 @@ impl Parser {
         let mut member_ty = None;
         let mut is_const = false;
         let mut ptr_depth = 0;
-        let mut static_array_len = None;
+        let mut array_dimensions = Vec::new();
         loop {
             use XmlEvent::*;
             match self.reader.next().expect("failed to parse XML") {
@@ -689,7 +689,7 @@ impl Parser {
                             member_name = Some(self.parse_characters());
                         }
                         "enum" => {
-                            static_array_len = Some(self.parse_characters());
+                            array_dimensions.push(self.parse_characters());
                         }
                         x => {
                             panic!("unexpected element: {}", x);
@@ -702,9 +702,12 @@ impl Parser {
                         is_const = ch.starts_with("const");
                     } else if member_name.is_none() {
                         ptr_depth = ch.chars().filter(|&x| x == '*').count();
-                    } else if ch.starts_with('[') && ch.len() > 1 {
-                        assert!(ch.ends_with(']'));
-                        static_array_len = Some(ch[1..ch.len() - 1].into());
+                    } else if ch.starts_with('[') || ch.starts_with(']') {
+                        array_dimensions.extend(
+                            ch.split(['[', ']'])
+                                .filter(|dimension| !dimension.is_empty())
+                                .map(str::to_owned),
+                        );
                     }
                 }
                 EndElement { name } => {
@@ -721,7 +724,7 @@ impl Parser {
             is_const,
             ptr_depth,
             ty: member_ty.unwrap(),
-            static_array_len,
+            array_dimensions,
             len: attr(attrs, "len").map(|x| x.split(',').map(|x| x.into()).collect()),
         }
     }
@@ -1759,7 +1762,7 @@ impl Parser {
                 || self.handles.contains(&member.ty)
                 || member.ty.starts_with("PFN");
             out.has_graphics |= member.ty == "XrSession" || member.ty == "XrSwapchain";
-            out.has_array |= member.static_array_len.is_some();
+            out.has_array |= !member.array_dimensions.is_empty();
             out.has_non_default |= member.ty == "XrTime";
             if member.ty != name {
                 if let Some(x) = self.structs.get(&member.ty) {
@@ -1791,11 +1794,15 @@ impl Parser {
 
         let (type_params, type_args, marker, marker_init) = base_meta.type_params();
         let builders = children.iter().map(|name| {
-            if name == "XrCompositionLayerPassthroughHTC"
-                || name == "XrCompositionLayerPassthroughANDROID"
-            {
-                // requires high-level implementation similar to `XrCompositionLayerPassthroughFB`,
-                // otherwise some setters on the generated builder won't compile
+            if matches!(
+                name.as_str(),
+                "XrCompositionLayerPassthroughHTC"
+                    | "XrCompositionLayerPassthroughANDROID"
+                    | "XrSpatialCapabilityConfigurationImageTrackingEXT"
+                    | "XrGoogleCloudAuthInfoApiKeyANDROID"
+                    | "XrGoogleCloudAuthInfoTokenANDROID"
+            ) {
+                // These builders require high-level ownership or string support.
                 return quote! {};
             }
             let ident = xr_ty_name(name);
@@ -1933,7 +1940,7 @@ impl Parser {
                     )
                 }
                 _ => {
-                    if m.static_array_len.is_some() {
+                    if !m.array_dimensions.is_empty() {
                         if m.ty != "char" {
                             return None;
                         }
@@ -2173,7 +2180,7 @@ impl Parser {
     fn is_simple_struct(&self, s: &Struct) -> bool {
         s.members.iter().all(|x| {
             x.ptr_depth == 0
-                && x.static_array_len.is_none()
+                && x.array_dimensions.is_empty()
                 && x.ty != "XrBool32"
                 && self
                     .structs
@@ -2290,7 +2297,7 @@ struct Member {
     is_const: bool,
     ptr_depth: usize,
     ty: String,
-    static_array_len: Option<String>,
+    array_dimensions: Vec<String>,
     len: Option<Vec<String>>,
 }
 
@@ -2331,6 +2338,8 @@ fn xr_enum_value_name(ty: &str, name: &str) -> Ident {
         "XrSpatialMarkerArucoDict" => "XR_SPATIAL_MARKER_ARUCO_".len(),
         "XrSpatialMarkerAprilTagDict" => "XR_SPATIAL_MARKER_APRIL_TAG_".len(),
         "XrAudioSampleRate" => "XR_AUDIO_SAMPLE_".len(),
+        "XrEnvironmentTextureResolution" => "XR_ENVIRONMENT_TEXTURE_".len(),
+        "XrGoogleCloudAuthError" => "XR_GOOGLE_CLOUD_AUTH_".len(),
         "XrSoundFieldChannelMaskAmbix" | "XrSoundFieldChannelMaskFuma" => {
             // AmbiX sound field and FuMA sound field channel masks share a common prefix
             "XR_SOUND_FIELD_CHANNEL_MASK_".len()
@@ -2361,6 +2370,9 @@ fn xr_bitmask_value_name(ty: &str, name: &str) -> Ident {
 }
 
 fn xr_var_name(raw: &str) -> Ident {
+    if raw == "box" {
+        return Ident::new_raw(raw, Span::call_site());
+    }
     let raw = match raw {
         "type" => "ty",
         _ => raw,
@@ -2369,9 +2381,9 @@ fn xr_var_name(raw: &str) -> Ident {
 }
 
 fn xr_arg_ty(api_aliases: &[(String, String)], member: &Member) -> TokenStream {
-    if member.static_array_len.is_some() {
+    if !member.array_dimensions.is_empty() {
         let mut clone = member.clone();
-        clone.static_array_len = None;
+        clone.array_dimensions.remove(0);
         clone.ptr_depth += 1;
         xr_var_ty(api_aliases, &clone)
     } else {
@@ -2380,7 +2392,7 @@ fn xr_arg_ty(api_aliases: &[(String, String)], member: &Member) -> TokenStream {
 }
 
 fn xr_var_ty(api_aliases: &[(String, String)], member: &Member) -> TokenStream {
-    let ty = if member.ty.starts_with("Xr") {
+    let mut ty = if member.ty.starts_with("Xr") {
         let ident = xr_ty_name(&member.ty);
         quote! { #ident }
     } else if member.ty.starts_with("PFN_") {
@@ -2414,7 +2426,7 @@ fn xr_var_ty(api_aliases: &[(String, String)], member: &Member) -> TokenStream {
         let ident = Ident::new(ty, Span::call_site());
         quote! { #ident }
     };
-    let mut ty = if let Some(ref len) = member.static_array_len {
+    for len in member.array_dimensions.iter().rev() {
         // If the len is a constant, we see if it is an aliased constant. Since we do not emit
         // aliased constant declarations, we must replace the alias with the original constant name
         // that we do emit.
@@ -2422,16 +2434,15 @@ fn xr_var_ty(api_aliases: &[(String, String)], member: &Member) -> TokenStream {
             Some((_, og)) => og,
             _ => len,
         };
-        if let Ok(len) = len.parse::<usize>() {
-            quote! { [#ty; #len] }
+        let len = if let Ok(len) = len.parse::<usize>() {
+            quote! { #len }
         } else {
             assert!(len.starts_with("XR_"));
             let len = Ident::new(&len[3..], Span::call_site());
-            quote! { [#ty; #len] }
-        }
-    } else {
-        quote! { #ty }
-    };
+            quote! { #len }
+        };
+        ty = quote! { [#ty; #len] };
+    }
     for _ in 0..member.ptr_depth {
         ty = if member.is_const {
             quote! { *const #ty }
